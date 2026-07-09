@@ -1,0 +1,44 @@
+# Git / ignore metadata
+.git/
+.gitignore
+.dockerignore
+
+# Secrets and runtime logs
+.env
+.env.local
+*.log
+solace-events.log
+
+# Python runtime / local dev (deps installed via requirements.txt in-container)
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Test / lint artifacts (not copied by Dockerfile)
+tests/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# IDE
+.idea/
+.vscode/
+
+# Docs (not needed in image)
+README.md
+
+# OS junk
+.DS_Store
+Thumbs.db
+Desktop.ini
