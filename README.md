@@ -46,7 +46,7 @@ Copy [`.env.example`](./.env.example) to `.env` in your **current working direct
 | `SOLACE_TOPIC` | Topic subscription when `topic` | — |
 | `SOLACE_QUEUE` | Queue name when `queue`, or browser default | — |
 | `SOLACE_BROWSER_PAGE_SIZE` | Default browser page size | `10` |
-| `SOLACE_CONSUME_MODE` | `continuous` or `step` | `continuous` |
+| `SOLACE_CONSUME_MODE` | `continuous` or `step` | `step` |
 | `SOLACE_CONSOLE_FULL` | Full metadata + payload on console | `false` |
 | `SOLACE_LOG_TO_FILE` | Append NDJSON to log file | `true` |
 | `SOLACE_LOG_FILE` | Log path (relative to cwd) | `solace-events.log` |

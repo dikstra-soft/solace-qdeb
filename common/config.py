@@ -95,7 +95,7 @@ class AppConfig:
                 f"SOLACE_SOURCE_TYPE must be 'topic' or 'queue', got '{source_raw}'."
             )
 
-        mode_raw = (get("SOLACE_CONSUME_MODE", default="continuous") or "continuous").lower()
+        mode_raw = (get("SOLACE_CONSUME_MODE", default="step") or "step").lower()
         if mode_raw in ("continuous", "normal", "stream"):
             mode = ConsumeMode.CONTINUOUS
         elif mode_raw in ("step", "paused", "manual", "single"):
