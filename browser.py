@@ -12,17 +12,23 @@ from typing import List, Optional, Tuple
 from solace.messaging.receiver.message_receiver import InboundMessage
 
 from common import payload_formatter
+from common.cli import parse_env_file
 from common.config import BrowserAppConfig
 from common.connection import SolaceConnection
 from common.event_file_logger import EventFileLogger
 from common.queue_browser import QueueBrowser
 
 QUIT_REQUESTED = False
+DUMP_ALL_ACTIVE = False
+DUMP_ALL_CANCEL = False
 
 
 def _install_quit_handler() -> None:
     def handler(signum, frame):  # noqa: ARG001
-        global QUIT_REQUESTED
+        global QUIT_REQUESTED, DUMP_ALL_CANCEL
+        if DUMP_ALL_ACTIVE:
+            DUMP_ALL_CANCEL = True
+            return
         QUIT_REQUESTED = True
 
     signal.signal(signal.SIGINT, handler)
@@ -77,31 +83,33 @@ def total_pages(total_count: int, page_size: int) -> int:
     return (total_count + page_size - 1) // page_size
 
 
-def clamp_page(page: int, total_count: int, page_size: int) -> int:
-    return max(1, min(page, total_pages(total_count, page_size)))
-
-
-def first_item_on_page(page: int, page_size: int, total_count: int) -> int:
-    first = (page - 1) * page_size + 1
-    return min(first, max(total_count, 1))
-
-
-def last_item_on_page(page: int, page_size: int, total_count: int) -> int:
-    if total_count == 0:
-        return 0
-    return min(page * page_size, total_count)
-
-
-def render_page_info(queue_name: str, page: int, page_size: int, total_count: int) -> None:
-    pages = total_pages(total_count, page_size)
-    if total_count == 0:
-        item_range = "none"
+def render_page_info(
+    queue_name: str,
+    page: int,
+    page_size: int,
+    known_total: Optional[int],
+    message_count: int,
+) -> None:
+    if known_total is not None:
+        pages = total_pages(known_total, page_size)
+        page_label = f"{page}/{pages}"
+        if known_total == 0:
+            items_label = "none"
+        else:
+            first = (page - 1) * page_size + 1
+            last = min(page * page_size, known_total)
+            items_label = f"{first}-{last} of {known_total}"
     else:
-        item_range = f"{first_item_on_page(page, page_size, total_count)}-{last_item_on_page(page, page_size, total_count)}"
+        page_label = f"{page}+"
+        if message_count == 0:
+            items_label = "none"
+        else:
+            first = (page - 1) * page_size + 1
+            items_label = f"{first}-{first + message_count - 1} of ?"
     print()
     print(
-        f"queue: {queue_name}  |  page {page}/{pages}  |  "
-        f"items {item_range} of {total_count}  |  page size {page_size}"
+        f"queue: {queue_name}  |  page {page_label}  |  "
+        f"items {items_label}  |  page size {page_size}"
     )
 
 
@@ -131,16 +139,17 @@ def print_help(detailed: bool = False) -> None:
             "  <n>         go to page n\n"
             "  n / p       next / previous page\n"
             "  s / size    change page size (returns to page 1)\n"
-            "  r           refresh (rescan queue, page 1)\n"
-            "  i<n>        full dump of absolute item #n (e.g. i5)\n"
+            "  r           refresh (reload page 1, no full count scan)\n"
+            "  i<n>        full dump of absolute item #n (1 = oldest, e.g. i5)\n"
             "  d           full dump of current page (console + log file)\n"
+            "  a / a<n>    dump all from oldest to file (optional limit, e.g. a100)\n"
             "  h           this help\n"
             "  q           quit\n"
-            "Item #1 is the newest message. Browsing is non-destructive.\n"
-            "Total count comes from a full oldest-first scan (may be slow on large queues)."
+            "Item #1 is the oldest message. Page 1 is the head of the queue (native browse order).\n"
+            "Browsing is non-destructive. Queue length is discovered while paging."
         )
     else:
-        print("Commands: <n>, n/p, s size, i<N>, d dump page, r refresh, h help, q quit")
+        print("Commands: <n>, n/p, s size, i<N>, d dump page, a/a<N> dump all, r refresh, h help, q quit")
 
 
 class BrowseAction(str, Enum):
@@ -151,6 +160,7 @@ class BrowseAction(str, Enum):
     PREV_PAGE = "prev"
     GO_TO_PAGE = "goto"
     DUMP_PAGE = "dump"
+    DUMP_ALL = "dump_all"
     DUMP_ITEM = "dump_item"
     CHANGE_PAGE_SIZE = "size"
 
@@ -173,6 +183,8 @@ def try_parse_command(command: str) -> Tuple[Optional[BrowseAction], int]:
         "previous": BrowseAction.PREV_PAGE,
         "d": BrowseAction.DUMP_PAGE,
         "dump": BrowseAction.DUMP_PAGE,
+        "a": BrowseAction.DUMP_ALL,
+        "all": BrowseAction.DUMP_ALL,
         "s": BrowseAction.CHANGE_PAGE_SIZE,
         "size": BrowseAction.CHANGE_PAGE_SIZE,
     }
@@ -187,35 +199,55 @@ def try_parse_command(command: str) -> Tuple[Optional[BrowseAction], int]:
     if item_prefix:
         return BrowseAction.DUMP_ITEM, int(item_prefix.group(1))
 
+    all_match = re.fullmatch(r"a(\d+)", lower)
+    if all_match:
+        return BrowseAction.DUMP_ALL, int(all_match.group(1))
+
+    all_prefix = re.fullmatch(r"(?:a|all)\s+(\d+)", command, flags=re.IGNORECASE)
+    if all_prefix:
+        return BrowseAction.DUMP_ALL, int(all_prefix.group(1))
+
     if lower.isdigit():
         return BrowseAction.GO_TO_PAGE, int(lower)
 
     return None, 0
 
 
-def rescan(
+def load_page_1(
     browser: QueueBrowser,
-    queue_name: str,
     page_size: int,
-) -> Tuple[int, List[InboundMessage], int]:
-    print()
-    print(f"Scanning queue '{queue_name}' (oldest-first pass to count messages)...")
-    total = browser.scan_total_count()
-    print(f"Found {total} message{'s' if total != 1 else ''}.")
-    current_page = 1
-    current_messages = browser.fetch_page(1, page_size, total) if total > 0 else []
-    return total, current_messages, current_page
+    known_total: Optional[int],
+) -> Tuple[List[InboundMessage], int, Optional[int]]:
+    messages = browser.fetch_page(1, page_size)
+    if len(messages) < page_size:
+        known_total = len(messages)
+    return messages, 1, known_total
 
 
-def go_to_page(
+def try_go_to_page(
     browser: QueueBrowser,
     page: int,
     page_size: int,
-    total_count: int,
-) -> List[InboundMessage]:
-    if total_count <= 0:
-        return []
-    return browser.fetch_page(page, page_size, total_count)
+    current_page: int,
+    current_messages: List[InboundMessage],
+    known_total: Optional[int],
+) -> Tuple[List[InboundMessage], int, Optional[int]]:
+    if page < 1:
+        page = 1
+    if known_total is not None:
+        page = max(1, min(page, total_pages(known_total, page_size)))
+    if page == current_page:
+        return current_messages, current_page, known_total
+
+    fetched = browser.fetch_page(page, page_size)
+    if len(fetched) == 0 and page > 1:
+        if page == current_page + 1 and len(current_messages) == page_size:
+            known_total = current_page * page_size
+        return current_messages, current_page, known_total
+
+    if len(fetched) < page_size:
+        known_total = (page - 1) * page_size + len(fetched)
+    return fetched, page, known_total
 
 
 def dump_page(
@@ -250,7 +282,7 @@ def dump_page(
         file_logger.write_line("--- solace-browser page dump ---")
         for message in items:
             try:
-                file_logger.write_line(payload_formatter.build_json_line(message))
+                file_logger.write_event(message)
                 logged += 1
             except Exception as exc:
                 errors.append(str(exc))
@@ -276,13 +308,80 @@ def dump_page(
     return True
 
 
-def dump_item(browser: QueueBrowser, absolute_item: int, total_count: int) -> bool:
-    if absolute_item < 1 or absolute_item > total_count:
-        print(f"  item #{absolute_item} is out of range (1..{total_count}).")
+def dump_all(
+    browser: QueueBrowser,
+    limit: int,
+    file_logger: Optional[EventFileLogger],
+    *,
+    log_to_file: bool,
+) -> bool:
+    global DUMP_ALL_ACTIVE, DUMP_ALL_CANCEL
+    if file_logger is None:
+        if log_to_file:
+            print("  (log file unavailable — open failed at startup; cannot dump all)")
+        else:
+            print("  (log file disabled — set SOLACE_LOG_TO_FILE=true to dump all to a file)")
         return False
-    message = browser.fetch_item(absolute_item, total_count)
+
+    cap = limit if limit > 0 else None
+    cap_label = f"oldest {cap}" if cap is not None else "all (oldest-first)"
+    print(f"  dumping {cap_label} to {file_logger.path} ...")
+
+    logged = 0
+    failed = 0
+    aborted = False
+    DUMP_ALL_CANCEL = False
+
+    def cancelled() -> bool:
+        return DUMP_ALL_CANCEL
+
+    DUMP_ALL_ACTIVE = True
+    try:
+        file_logger.write_line("")
+        file_logger.write_line("--- solace-browser dump-all ---")
+        try:
+            for message in browser.for_each_from_oldest(cap, cancelled=cancelled):
+                try:
+                    file_logger.write_event(message)
+                    logged += 1
+                    if logged == 1 or logged % 100 == 0:
+                        print(f"\r  dumped {logged}...", end="", flush=True)
+                except Exception as exc:
+                    failed += 1
+                    _ = exc
+        except KeyboardInterrupt:
+            DUMP_ALL_CANCEL = True
+            aborted = True
+        file_logger.write_line("--- solace-browser dump-all ---")
+        file_logger.write_line("")
+    except Exception as exc:
+        print()
+        print(f"  [logfile] dump-all failed: {exc}", file=sys.stderr)
+        return True
+    finally:
+        DUMP_ALL_ACTIVE = False
+
+    print()
+    if DUMP_ALL_CANCEL or aborted:
+        extra = f" ({failed} failed)" if failed else ""
+        print(f"  dump-all aborted after {logged} item(s){extra}.")
+    elif failed:
+        print(f"  dumped {logged} item(s) to {file_logger.path} ({failed} failed)")
+    else:
+        print(f"  dumped {logged} item(s) to {file_logger.path}")
+    return True
+
+
+def dump_item(browser: QueueBrowser, absolute_item: int, known_total: Optional[int]) -> bool:
+    if absolute_item < 1:
+        print(f"  item #{absolute_item} is out of range.")
+        return False
+    if known_total is not None and (known_total == 0 or absolute_item > known_total):
+        print(f"  item #{absolute_item} is out of range (1..{known_total}).")
+        return False
+    message = browser.fetch_item(absolute_item)
     if message is None:
-        print(f"  could not read item #{absolute_item}.")
+        print(f"  item #{absolute_item} is out of range.")
         return False
     print(payload_formatter.format_full_console(message, absolute_item), end="")
     sys.stdout.flush()
@@ -300,11 +399,17 @@ def main() -> int:
     print("solace-browser  (SMF queue browser, non-destructive)")
     print("---------------------------------------------------")
 
+    env_file, cli_error = parse_env_file()
+    if cli_error:
+        print(cli_error, file=sys.stderr)
+        return 1
+
     try:
-        config, env_path = BrowserAppConfig.load()
+        config, env_path = BrowserAppConfig.load(env_file)
     except Exception as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
-        print("Create a .env file (see .env.example).", file=sys.stderr)
+        if env_file is None:
+            print("Create a .env file (see .env.example).", file=sys.stderr)
         return 1
 
     if env_path is None:
@@ -335,8 +440,8 @@ def main() -> int:
     file_logger: Optional[EventFileLogger] = None
     if config.log_to_file:
         try:
-            file_logger = EventFileLogger.open(config.log_file)
-            print(f"log file ready for page dumps (`d`): {file_logger.path}")
+            file_logger = EventFileLogger.open(config.log_file, config.log_format)
+            print(f"log file ready for dumps (`d` page, `a` all): {file_logger.path}")
         except Exception as exc:
             print(
                 f"Could not open log file '{config.log_file}': {exc}. Continuing with console only.",
@@ -346,8 +451,11 @@ def main() -> int:
     print("connected.")
 
     browser = QueueBrowser(connection.service, queue_name)
+    known_total: Optional[int] = None
     try:
-        total_count, current_page_messages, current_page = rescan(browser, queue_name, page_size)
+        current_page_messages, current_page, known_total = load_page_1(
+            browser, page_size, known_total
+        )
     except Exception as exc:
         print(f"Failed to browse queue '{queue_name}': {exc}", file=sys.stderr)
         if file_logger:
@@ -357,7 +465,9 @@ def main() -> int:
 
     while not QUIT_REQUESTED:
         print("================================================")
-        render_page_info(queue_name, current_page, page_size, total_count)
+        render_page_info(
+            queue_name, current_page, page_size, known_total, len(current_page_messages)
+        )
         print()
         render_page_items(current_page_messages, current_page, page_size)
         print()
@@ -385,20 +495,24 @@ def main() -> int:
             pause_for_continue()
         elif action == BrowseAction.REFRESH:
             try:
-                total_count, current_page_messages, current_page = rescan(
-                    browser, queue_name, page_size
+                known_total = None
+                current_page_messages, current_page, known_total = load_page_1(
+                    browser, page_size, known_total
                 )
             except Exception as exc:
                 print(f"Refresh failed: {exc}", file=sys.stderr)
         elif action == BrowseAction.NEXT_PAGE:
-            current_page = clamp_page(current_page + 1, total_count, page_size)
-            current_page_messages = go_to_page(browser, current_page, page_size, total_count)
+            current_page_messages, current_page, known_total = try_go_to_page(
+                browser, current_page + 1, page_size, current_page, current_page_messages, known_total
+            )
         elif action == BrowseAction.PREV_PAGE:
-            current_page = clamp_page(current_page - 1, total_count, page_size)
-            current_page_messages = go_to_page(browser, current_page, page_size, total_count)
+            current_page_messages, current_page, known_total = try_go_to_page(
+                browser, current_page - 1, page_size, current_page, current_page_messages, known_total
+            )
         elif action == BrowseAction.GO_TO_PAGE:
-            current_page = clamp_page(number, total_count, page_size)
-            current_page_messages = go_to_page(browser, current_page, page_size, total_count)
+            current_page_messages, current_page, known_total = try_go_to_page(
+                browser, number, page_size, current_page, current_page_messages, known_total
+            )
         elif action == BrowseAction.DUMP_PAGE:
             if dump_page(
                 current_page_messages,
@@ -408,16 +522,18 @@ def main() -> int:
                 log_to_file=config.log_to_file,
             ):
                 pause_for_continue()
+        elif action == BrowseAction.DUMP_ALL:
+            if dump_all(browser, number, file_logger, log_to_file=config.log_to_file):
+                pause_for_continue()
         elif action == BrowseAction.DUMP_ITEM:
-            if dump_item(browser, number, total_count):
+            if dump_item(browser, number, known_total):
                 pause_for_continue()
         elif action == BrowseAction.CHANGE_PAGE_SIZE:
             changed, new_size = prompt_new_page_size(page_size)
             if changed:
                 page_size = new_size
-                current_page = 1
-                current_page_messages = (
-                    go_to_page(browser, 1, page_size, total_count) if total_count > 0 else []
+                current_page_messages, current_page, known_total = load_page_1(
+                    browser, page_size, known_total
                 )
 
     if file_logger:

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 def _script_root() -> Path:
@@ -38,8 +39,65 @@ def _parse_env_file(path: Path) -> Dict[str, str]:
     return result
 
 
-def load() -> Tuple[Dict[str, str], Optional[str]]:
-    """Load .env values. Returns (merged values, path of highest-priority file found)."""
+def _search_dirs() -> List[Path]:
+    return [Path.cwd(), _script_root()]
+
+
+def _is_simple_name(value: str) -> bool:
+    if not value or value in (".", ".."):
+        return False
+    p = Path(value)
+    if p.is_absolute():
+        return False
+    return p.parent == Path(".")
+
+
+def _existing_in_search_dirs(file_name: str) -> Optional[Path]:
+    for directory in _search_dirs():
+        candidate = directory / file_name
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+def _resolve_explicit(path: str) -> Path:
+    """Resolve -e/--env: as-is path, then .env.{value}, then {value} as a filename."""
+    tried: List[str] = [path]
+
+    given = Path(path)
+    as_is = given.resolve() if given.is_absolute() else (Path.cwd() / given).resolve()
+    if as_is.is_file():
+        return as_is
+
+    if _is_simple_name(path):
+        if not path.startswith(".env"):
+            dotted = f".env.{path}"
+            tried.append(dotted)
+            found = _existing_in_search_dirs(dotted)
+            if found is not None:
+                return found
+
+        found = _existing_in_search_dirs(path)
+        if found is not None:
+            return found
+
+    tried_list = ", ".join(f"'{t}'" for t in tried)
+    raise FileNotFoundError(f"Env file not found: tried {tried_list}")
+
+
+def load(path: Optional[str] = None) -> Tuple[Dict[str, str], Optional[str]]:
+    """Load .env values. Returns (merged values, path of highest-priority file found).
+
+    When *path* is set (from ``-e`` / ``--env``), it is resolved as a file path
+    or short name (``dev`` → ``.env.dev``) and must exist; relative paths
+    resolve against the current working directory.
+    When *path* is omitted and no ``.env`` is found, a warning is printed to
+    stderr and an empty dict is returned (process environment only).
+    """
+    if path is not None:
+        full = _resolve_explicit(path)
+        return _parse_env_file(full), str(full)
+
     cwd_file = Path.cwd() / ".env"
     script_file = _script_root() / ".env"
 
@@ -53,6 +111,12 @@ def load() -> Tuple[Dict[str, str], Optional[str]]:
     if cwd_file.is_file():
         merged.update(_parse_env_file(cwd_file))
         loaded_path = str(cwd_file)
+
+    if loaded_path is None:
+        print(
+            "WARN: no -e/--env given and no .env file found (cwd or beside binary); using process environment only",
+            file=sys.stderr,
+        )
 
     return merged, loaded_path
 

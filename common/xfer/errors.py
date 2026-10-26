@@ -1,0 +1,2 @@
+class XferError(Exception):
+    pass

@@ -6,7 +6,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY common/ common/
-COPY consumer.py browser.py .env.example ./
+COPY consumer.py browser.py publisher.py xfer.py .env.example ./
 
 ENV PYTHONUNBUFFERED=1
 

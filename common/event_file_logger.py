@@ -1,8 +1,12 @@
-"""Append one NDJSON line per event to a log file."""
+"""Append one line per event to a log file (NDJSON, simple, or payload-only)."""
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
+
+from common.config import LogFormat
+from common import payload_formatter
 
 
 def _script_root() -> Path:
@@ -26,18 +30,22 @@ def resolve_log_path(path: str) -> str:
 
 
 class EventFileLogger:
-    def __init__(self, path: str):
+    def __init__(self, path: str, log_format: LogFormat = LogFormat.FULL):
         self.path = resolve_log_path(path)
+        self.log_format = log_format
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self._file = open(self.path, "a", encoding="utf-8", buffering=1)
 
     @classmethod
-    def open(cls, path: str) -> "EventFileLogger":
-        return cls(path)
+    def open(cls, path: str, log_format: LogFormat = LogFormat.FULL) -> "EventFileLogger":
+        return cls(path, log_format)
 
     def write_line(self, line: str) -> None:
         self._file.write(line + "\n")
         self._file.flush()
+
+    def write_event(self, message: Any) -> None:
+        self.write_line(payload_formatter.build_log_line(message, self.log_format))
 
     def close(self) -> None:
         try:

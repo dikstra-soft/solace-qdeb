@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 
 from typing import Any, Callable, Dict, Optional
 
+from common.config import LogFormat
+
 
 
 from solace.messaging.receiver.message_receiver import InboundMessage
@@ -545,5 +547,31 @@ def build_json_line(message: InboundMessage) -> str:
 
 
     return json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+
+
+def _escape_payload_newlines(text: str) -> str:
+    return text.replace("\r", "\\r").replace("\n", "\\n")
+
+
+def build_simple_log_line(message: InboundMessage) -> str:
+    """Compact one-line log: [{timestamp}]::[{topic}]::{payload}."""
+    payload = _payload_bytes(message)
+    text = _escape_payload_newlines(_payload_text(payload))
+    dest = _safe_attr(message, "get_destination_name") or ""
+    return f"[{_simple_console_timestamp(message)}]::[{dest}]::{text}"
+
+
+def build_payload_only_log_line(message: InboundMessage) -> str:
+    """Payload only: UTF-8 body with \\n/\\r escaped. Empty payload is an empty string."""
+    payload = _payload_bytes(message)
+    return _escape_payload_newlines(_payload_text(payload))
+
+
+def build_log_line(message: InboundMessage, log_format: LogFormat) -> str:
+    if log_format == LogFormat.SIMPLE:
+        return build_simple_log_line(message)
+    if log_format == LogFormat.PAYLOAD_ONLY:
+        return build_payload_only_log_line(message)
+    return build_json_line(message)
 
 

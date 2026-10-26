@@ -1,4 +1,4 @@
-"""Non-destructive queue browse helper (tail-first pagination)."""
+"""Non-destructive queue browse helper (oldest-first pagination)."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ BROWSER_WINDOW_SIZE = 255
 
 
 class QueueBrowser:
-    """Maps tail-first item numbers (1 = newest) onto oldest-first API reads."""
+    """Reads the queue in native oldest-first order (item #1 = oldest)."""
 
     def __init__(self, service: MessagingService, queue_name: str):
         self._service = service
@@ -27,50 +27,49 @@ class QueueBrowser:
             .build(queue)
         )
 
-    def scan_total_count(self) -> int:
+    def fetch_page(self, page: int, page_size: int) -> List[InboundMessage]:
+        """Read one page from the head. A short page means end of queue."""
+        if page < 1 or page_size < 1:
+            return []
+
+        skip = (page - 1) * page_size
         browser = self._create_browser()
-        count = 0
+        try:
+            browser.start()
+            self._skip(browser, skip)
+            return self._read(browser, page_size)
+        finally:
+            browser.terminate()
+
+    def for_each_from_oldest(self, limit: Optional[int] = None, cancelled=None):
+        """Yield messages oldest-first. Caller should not retain them across iterations."""
+        if limit is not None and limit <= 0:
+            return
+        delivered = 0
+        browser = self._create_browser()
         try:
             browser.start()
             while True:
+                if cancelled is not None and cancelled():
+                    break
+                if limit is not None and delivered >= limit:
+                    break
                 message = browser.receive_message(timeout=RECEIVE_TIMEOUT_MS)
                 if message is None:
                     break
-                count += 1
-        finally:
-            browser.terminate()
-        return count
-
-    def fetch_page(self, page: int, page_size: int, total_count: int) -> List[InboundMessage]:
-        if total_count <= 0 or page < 1 or page_size < 1:
-            return []
-
-        start_item = (page - 1) * page_size + 1
-        if start_item > total_count:
-            return []
-
-        end_item = min(page * page_size, total_count)
-        skip_from_oldest = total_count - end_item
-        take = end_item - start_item + 1
-
-        browser = self._create_browser()
-        try:
-            browser.start()
-            self._skip(browser, skip_from_oldest)
-            batch = self._read(browser, take)
-            batch.reverse()
-            return batch
+                yield message
+                delivered += 1
         finally:
             browser.terminate()
 
-    def fetch_item(self, absolute_item: int, total_count: int) -> Optional[InboundMessage]:
-        if total_count <= 0 or absolute_item < 1 or absolute_item > total_count:
+    def fetch_item(self, absolute_item: int) -> Optional[InboundMessage]:
+        """Read a single message by absolute item number (1 = oldest)."""
+        if absolute_item < 1:
             return None
-        skip_from_oldest = total_count - absolute_item
         browser = self._create_browser()
         try:
             browser.start()
-            self._skip(browser, skip_from_oldest)
+            self._skip(browser, absolute_item - 1)
             return browser.receive_message(timeout=RECEIVE_TIMEOUT_MS)
         finally:
             browser.terminate()
