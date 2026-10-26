@@ -1,6 +1,6 @@
 # solace-subber
 
-Python Solace debugging tools using the official [`solace-pubsubplus`](https://pypi.org/project/solace-pubsubplus/) API. Companion to the .NET tools in [solace-qdeb](../solace-qdeb).
+Python Solace debugging tools using the official [`solace-pubsubplus`](https://pypi.org/project/solace-pubsubplus/) API.
 
 Included tools:
 
