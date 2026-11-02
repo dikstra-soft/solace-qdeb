@@ -8,7 +8,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from solace.messaging.config.solace_properties import message_properties
 from solace.messaging.messaging_service import MessagingService
@@ -157,6 +157,7 @@ def run_unattended(
     stats: SessionStats,
     runtime: RuntimeState,
     ack_timeout_ms: int,
+    stamps: TimestampSeq,
 ) -> int:
     if publish_count <= 0:
         print(
@@ -165,7 +166,6 @@ def run_unattended(
         )
         return 1
 
-    stamps = TimestampSeq()
     sent = 0
     failed = 0
     for i in range(publish_count):
@@ -448,17 +448,20 @@ def send_one(
 def send_copies(
     service: MessagingService,
     handles: PublisherHandles,
-    blueprint: LastSend,
+    blueprint: Optional[LastSend],
     count: int,
     stats: SessionStats,
     runtime: RuntimeState,
     ack_timeout_ms: int,
+    next_blueprint: Optional[Callable[[], LastSend]] = None,
 ) -> None:
     ok = 0
     for i in range(count):
         if runtime.quit_requested:
             break
-        if send_one(service, handles, blueprint, stats, i + 1, count, ack_timeout_ms):
+        current = next_blueprint() if next_blueprint is not None else blueprint
+        assert current is not None
+        if send_one(service, handles, current, stats, i + 1, count, ack_timeout_ms):
             ok += 1
     if count > 1:
         print(f"  summary: {ok}/{count} succeeded")
@@ -602,7 +605,8 @@ def main() -> int:
 
     runtime = RuntimeState()
     stats = SessionStats()
-    last_send: Optional[LastSend] = None
+    stamps = TimestampSeq()
+    last_send: Optional[LastSend] = None;
     stdin = StdinLinePump()
     install_publisher_signal_handler(runtime)
 
@@ -676,6 +680,7 @@ def main() -> int:
                 stats,
                 runtime,
                 ack_timeout_ms,
+                stamps,
             )
 
         while not runtime.quit_requested:
@@ -712,20 +717,41 @@ def main() -> int:
                 payload_text = read_line_cancellable(runtime, stdin)
                 if should_abort_prompt(runtime, payload_text) or runtime.quit_requested:
                     break
-                payload = (payload_text or "").encode("utf-8")
-                last_send = LastSend.from_payload(
-                    payload, dest_type, dest_name, delivery
-                )
                 n = count if action == PublishAction.SEND_N else 1
-                send_copies(
-                    connection.service,
-                    handles,
-                    last_send,
-                    n,
-                    stats,
-                    runtime,
-                    ack_timeout_ms,
-                )
+                if not (payload_text or ""):
+                    def _next_timestamp() -> LastSend:
+                        nonlocal last_send
+                        last_send = LastSend.from_payload(
+                            stamps.next().encode("utf-8"),
+                            dest_type,
+                            dest_name,
+                            delivery,
+                        )
+                        return last_send
+
+                    send_copies(
+                        connection.service,
+                        handles,
+                        last_send,
+                        n,
+                        stats,
+                        runtime,
+                        ack_timeout_ms,
+                        next_blueprint=_next_timestamp,
+                    )
+                else:
+                    last_send = LastSend.from_payload(
+                        payload_text.encode("utf-8"), dest_type, dest_name, delivery
+                    )
+                    send_copies(
+                        connection.service,
+                        handles,
+                        last_send,
+                        n,
+                        stats,
+                        runtime,
+                        ack_timeout_ms,
+                    )
                 continue
 
             if action == PublishAction.SEND_RAW:

@@ -55,7 +55,7 @@ Copy [`.env.example`](./.env.example) to `.env` in your **current working direct
 | `SOLACE_TOPIC` | **Legacy** consume+publish topic (used only if the SOURCE_/DEST_ topic keys are unset) | — |
 | `SOLACE_QUEUE` | **Legacy** consume+browse+publish queue (used only if the SOURCE_/DEST_ queue keys are unset) | — |
 | `SOLACE_BROWSER_PAGE_SIZE` | Default browser page size | `10` |
-| `SOLACE_INTERACTIVE` | `true` = startup wizard (consumer dest/mode/start-gate, publisher dest prompts, xfer confirms). `false` = take env/CLI and proceed. **Does not affect the browser.** | `false` |
+| `SOLACE_INTERACTIVE` | `true` = startup wizard (consumer dest/mode/start-gate, publisher dest prompts, xfer confirms). `false` = take env/CLI and proceed (set false for kube/unattended). **Does not affect the browser.** | `true` |
 | `SOLACE_CONSUME_MODE` | `continuous` or `step`. When **unset**, defaults by dest: queue→`step`, topic→`continuous`. When `SOLACE_INTERACTIVE=false`, `step` is ignored (treated as continuous) | *(auto)* |
 | `SOLACE_RECONNECT_MODE` | `seamless` (keep consuming / rebind) or `stop` (interactive: return to mode menu; non-interactive: exit with error) | `seamless` |
 | `SOLACE_DELIVERY_MODE` | Publisher: `auto` / `direct` / `persistent` (`auto` = Direct for topic, Persistent for queue) | `auto` |
@@ -80,12 +80,13 @@ python consumer.py -e ./configs/broker.env
 python consumer.py --env /abs/path/to/.env
 ```
 
-Default `SOLACE_INTERACTIVE=false` skips dest/mode/start-gate prompts and starts
+Default `SOLACE_INTERACTIVE=true` runs the menu loop (same UX as `solace-consumer` in solace-qdeb).
+Set `SOLACE_INTERACTIVE=false` for kube/unattended: skip dest/mode/start-gate prompts and start
 consuming from `SOLACE_SOURCE_*` (legacy `SOLACE_TOPIC` / `SOLACE_QUEUE` if unset).
 **`SOLACE_CONSUME_MODE=step` is ignored** (queue default step too): consume runs
 continuous with no Mode?/start-gate/per-message Enter. The summary notes
 `mode=continuous (step bypassed; non-interactive)` when that happens.
-Ctrl+C quits. Set `SOLACE_INTERACTIVE=true` for the menu loop (same UX as `solace-consumer` in solace-qdeb):
+Ctrl+C quits. Menu loop:
 
 1. Dest type: `[q]ueue` / `[t]opic` (default from env)
 2. Queue/topic name prompt (fixed for the session). Topic accepts a comma-separated list (e.g. `a/b, c/d/>`); each entry is subscribed.
@@ -122,11 +123,11 @@ python publisher.py -e dev      # loads .env.dev
 python publisher.py -e ./configs/broker.env
 ```
 
-Uses `SOLACE_DEST_TYPE` / `SOLACE_DEST_TOPIC` / `SOLACE_DEST_QUEUE` (legacy source keys if unset). With `SOLACE_INTERACTIVE=true`, prompts for topic or queue then enters the publish menu (`SOLACE_PUBLISH_COUNT` is ignored). Default non-interactive skips dest questions and the menu: it sends `SOLACE_PUBLISH_COUNT` messages (default 1) and exits. Each payload is a unique UTC ISO-8601 timestamp with milliseconds (e.g. `2026-11-02T03:21:00.123Z`). Count ≤ 0 or a missing dest is an error. Exit 0 if all sends succeed; non-zero if any fail. Validates queue destinations via a short browse bind:
+Uses `SOLACE_DEST_TYPE` / `SOLACE_DEST_TOPIC` / `SOLACE_DEST_QUEUE` (legacy source keys if unset). With `SOLACE_INTERACTIVE=true` (default), prompts for topic or queue then enters the publish menu (`SOLACE_PUBLISH_COUNT` is ignored). Set `SOLACE_INTERACTIVE=false` for kube/unattended to skip dest questions and the menu: it sends `SOLACE_PUBLISH_COUNT` messages (default 1) and exits. Each payload is a unique UTC ISO-8601 timestamp with milliseconds (e.g. `2026-11-02T03:21:00.123Z`). Count ≤ 0 or a missing dest is an error. Exit 0 if all sends succeed; non-zero if any fail. Validates queue destinations via a short browse bind:
 
 | Command | Action |
 | --- | --- |
-| `s` | Prompt for a payload line; send UTF-8 bytes as-is |
+| `s` | Prompt for a payload line; send UTF-8 bytes as-is. Empty Enter sends a unique UTC ISO-8601 timestamp (same as unattended); `r` resends that stored timestamp. Empty `sr` JSON is still an error |
 | `sr` | Paste one consumer NDJSON/JSON line; rebuild & send |
 | `s<n>` | Prompt once, send that payload *n* times (e.g. `s5`) |
 | `r` | Resend last payload (WARN if nothing sent yet) |

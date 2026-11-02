@@ -274,7 +274,7 @@ class AppConfig:
             mode=mode,
             mode_explicit=mode_explicit,
             reconnect_mode=reconnect_mode,
-            interactive=get_bool("SOLACE_INTERACTIVE", False),
+            interactive=get_bool("SOLACE_INTERACTIVE", True),
             console_full=get_bool("SOLACE_CONSOLE_FULL", False),
             log_to_file=get_bool("SOLACE_LOG_TO_FILE", True),
             log_file=get("SOLACE_LOG_FILE", default="solace-events.log") or "solace-events.log",
@@ -504,7 +504,7 @@ class PublisherAppConfig:
             topic=env_first(env_file, "SOLACE_DEST_TOPIC", "SOLACE_TOPIC"),
             queue=env_first(env_file, "SOLACE_DEST_QUEUE", "SOLACE_QUEUE"),
             delivery_mode=delivery,
-            interactive=get_bool("SOLACE_INTERACTIVE", False),
+            interactive=get_bool("SOLACE_INTERACTIVE", True),
             publish_count=get_int("SOLACE_PUBLISH_COUNT", 1),
         )
 
@@ -650,7 +650,7 @@ class XferAppConfig:
             topic=env_first(env_file, "SOLACE_DEST_TOPIC", "SOLACE_TOPIC"),
             queue=env_first(env_file, "SOLACE_DEST_QUEUE", "SOLACE_QUEUE"),
             chunk_bytes=chunk,
-            interactive=get_bool("SOLACE_INTERACTIVE", False),
+            interactive=get_bool("SOLACE_INTERACTIVE", True),
             role=parse_xfer_role(dotenv.get("SOLACE_XFER_ROLE", env_file, default=None)),
         )
 
