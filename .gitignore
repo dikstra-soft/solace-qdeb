@@ -1,6 +1,9 @@
+
 # Local config (may contain credentials)
 .env
 .env.local
+.env.*
+!.env.example
 
 # Python
 __pycache__/

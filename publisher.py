@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -22,6 +22,7 @@ from common.config import (
     MessageDeliveryKind,
     PublisherAppConfig,
     SourceType,
+    parse_topics,
 )
 from common.connection import SolaceConnection
 from common.prompts import (
@@ -112,7 +113,22 @@ class PublisherHandles:
                 pass
 
 
-def quit_with_stats(stats: SessionStats) -> int:
+class TimestampSeq:
+    """ISO-8601 UTC timestamps with milliseconds; unique across Next() calls."""
+
+    def __init__(self) -> None:
+        self._last_ms = 0
+
+    def next(self) -> str:
+        ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        if ms <= self._last_ms:
+            ms = self._last_ms + 1
+        self._last_ms = ms
+        dt = datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+        return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def print_session_stats(stats: SessionStats) -> None:
     print()
     print("session stats:")
     print(f"  attempts = {stats.attempts}")
@@ -122,9 +138,51 @@ def quit_with_stats(stats: SessionStats) -> int:
     if stats.started_at is not None:
         duration = datetime.now().astimezone() - stats.started_at
         print(f"  duration = {duration.total_seconds():.3f}s")
+
+
+def quit_with_stats(stats: SessionStats) -> int:
+    print_session_stats(stats)
     print()
     print("bye.")
     return 0
+
+
+def run_unattended(
+    service: MessagingService,
+    handles: PublisherHandles,
+    dest_type: SourceType,
+    dest_name: str,
+    delivery: MessageDeliveryKind,
+    publish_count: int,
+    stats: SessionStats,
+    runtime: RuntimeState,
+    ack_timeout_ms: int,
+) -> int:
+    if publish_count <= 0:
+        print(
+            "ERROR: SOLACE_PUBLISH_COUNT must be a positive integer.",
+            file=sys.stderr,
+        )
+        return 1
+
+    stamps = TimestampSeq()
+    sent = 0
+    failed = 0
+    for i in range(publish_count):
+        if runtime.quit_requested:
+            break
+        payload = stamps.next().encode("utf-8")
+        blueprint = LastSend.from_payload(payload, dest_type, dest_name, delivery)
+        if send_one(service, handles, blueprint, stats, i + 1, publish_count, ack_timeout_ms):
+            sent += 1
+        else:
+            failed += 1
+
+    print(f"unattended: sent {sent}, failed {failed}")
+    print_session_stats(stats)
+    print()
+    print("bye.")
+    return 1 if failed > 0 or sent != publish_count else 0
 
 
 def print_help(*, detailed: bool = False) -> None:
@@ -563,23 +621,62 @@ def main() -> int:
         ack_timeout_ms = max(config.connect_timeout_ms, 10000)
 
         runtime.phase = PromptPhase.STARTUP
-        dest_type = config.source
-        if dest_type == SourceType.QUEUE:
-            chosen = prompt_queue(config.queue, runtime, stdin)
-            if chosen is None or runtime.quit_requested:
-                return quit_with_stats(stats)
-            dest_name = chosen
-            if not try_validate_queue(connection.service, dest_name):
-                return 1
+        dest_type = config.dest_type
+        if config.interactive:
+            if dest_type == SourceType.QUEUE:
+                chosen = prompt_queue(config.queue, runtime, stdin)
+                if chosen is None or runtime.quit_requested:
+                    return quit_with_stats(stats)
+                dest_name = chosen
+                if not try_validate_queue(connection.service, dest_name):
+                    return 1
+            else:
+                topics = prompt_topic(config.topic, runtime, stdin)
+                if topics is None or runtime.quit_requested:
+                    return quit_with_stats(stats)
+                dest_name = topics[0]
         else:
-            topics = prompt_topic(config.topic, runtime, stdin)
-            if topics is None or runtime.quit_requested:
-                return quit_with_stats(stats)
-            dest_name = topics[0]
+            if dest_type == SourceType.QUEUE:
+                if not config.queue.strip():
+                    print(
+                        "ERROR: SOLACE_DEST_TYPE=queue requires SOLACE_DEST_QUEUE "
+                        "(or legacy SOLACE_QUEUE).",
+                        file=sys.stderr,
+                    )
+                    return 1
+                dest_name = config.queue.strip()
+                if not try_validate_queue(connection.service, dest_name):
+                    return 1
+            else:
+                topics = parse_topics(config.topic)
+                if not topics:
+                    print(
+                        "ERROR: SOLACE_DEST_TYPE=topic requires SOLACE_DEST_TOPIC "
+                        "(or legacy SOLACE_TOPIC).",
+                        file=sys.stderr,
+                    )
+                    return 1
+                dest_name = topics[0]
+            print(
+                f"using: dest={dest_type.value} '{dest_name}' interactive=off"
+            )
 
         delivery = config.resolve_delivery(dest_type)
         print()
         print(config.describe(dest_type, dest_name, delivery))
+
+        if not config.interactive:
+            return run_unattended(
+                connection.service,
+                handles,
+                dest_type,
+                dest_name,
+                delivery,
+                config.publish_count,
+                stats,
+                runtime,
+                ack_timeout_ms,
+            )
 
         while not runtime.quit_requested:
             runtime.clear_cancel()

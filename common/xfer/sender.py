@@ -86,6 +86,7 @@ def run(
     persistent: PersistentMessagePublisher,
     direct: DirectMessagePublisher,
     ack_timeout_ms: int,
+    interactive: bool = True,
 ) -> None:
     path = Path(file_path)
     if not path.is_file():
@@ -105,12 +106,13 @@ def run(
     sha256 = hash_file(path)
     print(f" {sha256}")
 
-    print("Has the receiver been started? [y]/n: ", end="", flush=True)
-    confirm = read_line_xfer(runtime, stdin)
-    if should_abort_prompt(runtime, confirm):
-        raise KeyboardInterrupt
-    if (confirm or "").strip().lower() in ("n", "no"):
-        raise XferError("aborted: receiver not started")
+    if interactive:
+        print("Has the receiver been started? [y]/n: ", end="", flush=True)
+        confirm = read_line_xfer(runtime, stdin)
+        if should_abort_prompt(runtime, confirm):
+            raise KeyboardInterrupt
+        if (confirm or "").strip().lower() in ("n", "no"):
+            raise XferError("aborted: receiver not started")
 
     delivery = (
         MessageDeliveryKind.PERSISTENT

@@ -12,7 +12,7 @@ from solace.messaging.publisher.direct_message_publisher import DirectMessagePub
 from solace.messaging.publisher.persistent_message_publisher import PersistentMessagePublisher
 
 from common.cli import parse_cli
-from common.config import SourceType, XferAppConfig
+from common.config import SourceType, XferAppConfig, parse_topics
 from common.connection import SolaceConnection
 from common.prompts import (
     RuntimeState,
@@ -129,7 +129,10 @@ def offer_delete_if_needed(
     connection: Optional[SolaceConnection],
     runtime: RuntimeState,
     stdin: StdinLinePump,
+    interactive: bool,
 ) -> None:
+    if not interactive:
+        return
     if not created_by_us or dest_type != SourceType.QUEUE or connection is None:
         return
     if not dest_name:
@@ -228,6 +231,7 @@ def main() -> int:
             connection,
             runtime,
             stdin,
+            config.interactive,
         )
         return exit_code
 
@@ -241,26 +245,58 @@ def main() -> int:
         print("connected.")
         print()
 
-        role = prompt_role(runtime, stdin)
-        if role is None or runtime.quit_requested:
-            return 0
+        if config.interactive:
+            role = prompt_role(runtime, stdin)
+            if role is None or runtime.quit_requested:
+                return 0
 
-        dest = prompt_dest_type(runtime, stdin)
-        if dest is None or runtime.quit_requested:
-            return 0
-        dest_type = dest
+            dest = prompt_dest_type(runtime, stdin)
+            if dest is None or runtime.quit_requested:
+                return 0
+            dest_type = dest
 
-        name = prompt_dest_name(dest_type, runtime, stdin)
-        if name is None or runtime.quit_requested:
-            return 0
-        dest_name = name
+            name = prompt_dest_name(dest_type, runtime, stdin)
+            if name is None or runtime.quit_requested:
+                return 0
+            dest_name = name
+        else:
+            if config.role is None:
+                print(
+                    "ERROR: SOLACE_XFER_ROLE=sender|receiver is required when SOLACE_INTERACTIVE=false.",
+                    file=sys.stderr,
+                )
+                return 1
+            role = config.role.value
+            dest_type = config.dest_type
+            if dest_type == SourceType.QUEUE:
+                dest_name = config.queue.strip()
+            else:
+                topics = parse_topics(config.topic)
+                dest_name = topics[0] if topics else config.topic.strip()
+            if not dest_name:
+                print(
+                    "ERROR: SOLACE_DEST_QUEUE (or legacy SOLACE_QUEUE) is required when SOLACE_INTERACTIVE=false and dest is queue."
+                    if dest_type == SourceType.QUEUE
+                    else "ERROR: SOLACE_DEST_TOPIC (or legacy SOLACE_TOPIC) is required when SOLACE_INTERACTIVE=false and dest is topic.",
+                    file=sys.stderr,
+                )
+                return 1
+            if role == "sender" and not (cli_path and cli_path.strip()):
+                print(
+                    "ERROR: sender file path is required (first positional argument) when SOLACE_INTERACTIVE=false.",
+                    file=sys.stderr,
+                )
+                return 1
+            print(
+                f"using: role={role} dest={dest_type.value} '{dest_name}' interactive=off"
+            )
         print(f"using {dest_type.value}: {dest_name}")
 
         if dest_type == SourceType.QUEUE:
             ensured = queue_ops.ensure_exclusive_queue(connection.service, dest_name)
             if not ensured.ok:
                 print(f"ERROR: {ensured.error}", file=sys.stderr)
-                if role == "sender" and ensured.missing_and_cannot_create:
+                if config.interactive and role == "sender" and ensured.missing_and_cannot_create:
                     fallback = prompt_yes_no(
                         "Publish to a topic instead?", True, runtime, stdin
                     )
@@ -297,11 +333,19 @@ def main() -> int:
             )
 
         if role == "sender":
-            file_path = prompt_file_path(cli_path, runtime, stdin)
+            file_path = (
+                prompt_file_path(cli_path, runtime, stdin)
+                if config.interactive
+                else (cli_path.strip() if cli_path else None)
+            )
             if file_path is None or runtime.quit_requested:
                 return after_transfer(1 if created_by_us and dest_type == SourceType.QUEUE else (0 if runtime.quit_requested else 1))
 
-            chunk = prompt_chunk_size(config.chunk_bytes, runtime, stdin)
+            chunk = (
+                prompt_chunk_size(config.chunk_bytes, runtime, stdin)
+                if config.interactive
+                else config.chunk_bytes
+            )
             if chunk is None or runtime.quit_requested:
                 return after_transfer(1 if created_by_us and dest_type == SourceType.QUEUE else (0 if runtime.quit_requested else 1))
 
@@ -321,6 +365,7 @@ def main() -> int:
                 handles_persistent,
                 handles_direct,
                 ack_timeout_ms,
+                config.interactive,
             )
             transfer_ok = True
         else:
@@ -332,6 +377,7 @@ def main() -> int:
                 cli_path,
                 runtime,
                 stdin,
+                config.interactive,
             )
             transfer_ok = True
 

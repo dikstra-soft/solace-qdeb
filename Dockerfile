@@ -10,4 +10,6 @@ COPY consumer.py browser.py publisher.py xfer.py .env.example ./
 
 ENV PYTHONUNBUFFERED=1
 
-ENTRYPOINT ["/bin/bash"]
+# Parked debug image for Kubernetes: PID 1 idles; exec in to run tools.
+# Runs as root (simpler for kube troubleshooting / writable /app logs).
+ENTRYPOINT ["sleep", "infinity"]

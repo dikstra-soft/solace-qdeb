@@ -30,11 +30,12 @@ def run(
     dest_path_hint: Optional[str],
     runtime: RuntimeState,
     stdin: StdinLinePump,
+    interactive: bool = True,
 ) -> None:
     if dest_type == SourceType.QUEUE:
-        _run_queue(service, dest_name, created_by_us, dest_path_hint, runtime, stdin)
+        _run_queue(service, dest_name, created_by_us, dest_path_hint, runtime, stdin, interactive)
     else:
-        _run_topic(service, dest_name, dest_path_hint, runtime, stdin)
+        _run_topic(service, dest_name, dest_path_hint, runtime, stdin, interactive)
 
 
 def _peek_meta(service: MessagingService, queue_name: str, runtime: RuntimeState):
@@ -74,6 +75,7 @@ def _run_queue(
     dest_path_hint: Optional[str],
     runtime: RuntimeState,
     stdin: StdinLinePump,
+    interactive: bool,
 ) -> None:
     print(f"waiting for META on queue '{queue_name}' (browser peek, non-destructive)...")
     peeked = None
@@ -91,7 +93,7 @@ def _run_queue(
         )
 
     if browser_worked:
-        dest_path = _prompt_dest_path(peeked, dest_path_hint, runtime, stdin)
+        dest_path = _prompt_dest_path(peeked, dest_path_hint, runtime, stdin, interactive)
         _consume_after_peek(service, queue_name, peeked, dest_path, runtime)
         return
 
@@ -100,7 +102,7 @@ def _run_queue(
         return
 
     print("holding first message unacked until filename is confirmed (will not NACK/Reject).")
-    _consume_hold_unacked(service, queue_name, created_by_us, dest_path_hint, runtime, stdin)
+    _consume_hold_unacked(service, queue_name, created_by_us, dest_path_hint, runtime, stdin, interactive)
 
 
 def _take(receiver, runtime: RuntimeState):
@@ -143,6 +145,7 @@ def _consume_hold_unacked(
     dest_path_hint: Optional[str],
     runtime: RuntimeState,
     stdin: StdinLinePump,
+    interactive: bool,
 ) -> None:
     receiver = queue_ops.build_hold_receiver(service, queue_name)
     try:
@@ -161,7 +164,7 @@ def _consume_hold_unacked(
                     file=sys.stderr,
                 )
             raise XferError(f"first message is not META ({err})")
-        dest_path = _prompt_dest_path(meta, dest_path_hint, runtime, stdin)
+        dest_path = _prompt_dest_path(meta, dest_path_hint, runtime, stdin, interactive)
         receiver.ack(first)
         _drain_rest(receiver, meta, dest_path, runtime, ack=True)
     finally:
@@ -256,6 +259,7 @@ def _run_topic(
     dest_path_hint: Optional[str],
     runtime: RuntimeState,
     stdin: StdinLinePump,
+    interactive: bool,
 ) -> None:
     subscriptions = [TopicSubscription.of(topic_name)]
     receiver = (
@@ -276,7 +280,7 @@ def _run_topic(
             raise XferError(
                 f"first message is not META ({err}). Direct message already delivered (cannot unread)."
             )
-        dest_path = _prompt_dest_path(meta, dest_path_hint, runtime, stdin)
+        dest_path = _prompt_dest_path(meta, dest_path_hint, runtime, stdin, interactive)
         _drain_rest(receiver, meta, dest_path, runtime, ack=False)
     finally:
         try:
@@ -290,6 +294,7 @@ def _prompt_dest_path(
     dest_path_hint: Optional[str],
     runtime: RuntimeState,
     stdin: StdinLinePump,
+    interactive: bool,
 ) -> str:
     suggested = Path(dest_path_hint) if dest_path_hint else Path(Path(meta.file_name).name)
     suggested = suggested.resolve()
@@ -297,17 +302,25 @@ def _prompt_dest_path(
         f"META  transferId={meta.transfer_id}  file={meta.file_name}  "
         f"size={meta.file_size}  chunks={meta.total_chunks}"
     )
-    print(f"Save as? (default {suggested}): ", end="", flush=True)
-    value = read_line_xfer(runtime, stdin)
-    if should_abort_prompt(runtime, value):
-        raise KeyboardInterrupt
-    chosen = suggested if not (value or "").strip() else Path(value.strip()).resolve()
-    return str(_avoid_overwrite(chosen, runtime, stdin))
+    if interactive:
+        print(f"Save as? (default {suggested}): ", end="", flush=True)
+        value = read_line_xfer(runtime, stdin)
+        if should_abort_prompt(runtime, value):
+            raise KeyboardInterrupt
+        chosen = suggested if not (value or "").strip() else Path(value.strip()).resolve()
+    else:
+        chosen = suggested
+        print(f"save as: {chosen}")
+    return str(_avoid_overwrite(chosen, runtime, stdin, interactive))
 
 
-def _avoid_overwrite(path: Path, runtime: RuntimeState, stdin: StdinLinePump) -> Path:
+def _avoid_overwrite(
+    path: Path, runtime: RuntimeState, stdin: StdinLinePump, interactive: bool
+) -> Path:
     if not path.is_file():
         return path
+    if not interactive:
+        raise XferError(f"destination file exists: {path}")
     alt = _next_free_path(path)
     print(
         f"File '{path}' exists (will not overwrite). Use '{alt}' instead? [y]/n: ",

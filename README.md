@@ -6,7 +6,7 @@ Included tools:
 
 - **`consumer.py`** — consumes messages from a **topic** or **queue** over plain or secure SMF, with continuous or step mode, concise/full console output, and optional file logging (`full` NDJSON, `simple`, or `payload_only` lines).
 - **`browser.py`** — non-destructive **queue browser** with oldest-first pagination, compact one-line items, and on-demand full dumps.
-- **`publisher.py`** — publishes to a **topic** or **directly to a queue**. Interactive menu to send payloads, replay consumer NDJSON lines (`sr`), burst-send (`s<n>`), resend last, and change destination.
+- **`publisher.py`** — publishes to a **topic** or **directly to a queue**. Interactive menu to send payloads, replay consumer NDJSON lines (`sr`), burst-send (`s<n>`), resend last, and change destination. When `SOLACE_INTERACTIVE=false`, sends `SOLACE_PUBLISH_COUNT` timestamp payloads and exits.
 - **`xfer.py`** — siphon a file (max 100 MiB) over SMF as META / DATA / END messages. Sender and receiver share a queue (provisioned if needed) or a topic (Direct; receiver must already be subscribed).
 
 Planned work (not implemented yet): see [BACKLOG.md](./BACKLOG.md) — next item is a **replayer** (consumer-like siphon to a sink topic/queue, with browse vs drain).
@@ -46,20 +46,28 @@ Copy [`.env.example`](./.env.example) to `.env` in your **current working direct
 | `SOLACE_SSL_VALIDATE_CERT` | Validate TLS cert when secure | `false` |
 | `SOLACE_CONNECT_TIMEOUT_MS` | Connect timeout (ms) | `10000` |
 | `SOLACE_RECONNECT_RETRIES` | Reconnect attempts | `3` |
-| `SOLACE_SOURCE_TYPE` | `topic` or `queue` (consume source / publisher default dest type) | `topic` |
-| `SOLACE_TOPIC` | Topic(s) for consume (comma-separated list OK) / publisher default topic | — |
-| `SOLACE_QUEUE` | Queue name when `queue`, browser default, or publisher queue dest | — |
+| `SOLACE_SOURCE_TYPE` | Consume source: `topic` or `queue` | `topic` |
+| `SOLACE_SOURCE_TOPIC` | Consume topic(s), comma-separated. Falls back to `SOLACE_TOPIC` | — |
+| `SOLACE_SOURCE_QUEUE` | Consume / browser default queue. Falls back to `SOLACE_QUEUE` | — |
+| `SOLACE_DEST_TYPE` | Publisher / xfer dest: `topic` or `queue`. Falls back to `SOLACE_SOURCE_TYPE` | `topic` |
+| `SOLACE_DEST_TOPIC` | Publisher / xfer topic. Falls back to `SOLACE_TOPIC` | — |
+| `SOLACE_DEST_QUEUE` | Publisher / xfer queue. Falls back to `SOLACE_QUEUE` | — |
+| `SOLACE_TOPIC` | **Legacy** consume+publish topic (used only if the SOURCE_/DEST_ topic keys are unset) | — |
+| `SOLACE_QUEUE` | **Legacy** consume+browse+publish queue (used only if the SOURCE_/DEST_ queue keys are unset) | — |
 | `SOLACE_BROWSER_PAGE_SIZE` | Default browser page size | `10` |
-| `SOLACE_CONSUME_MODE` | `continuous` or `step`. When **unset**, defaults by dest: queue→`step`, topic→`continuous` | *(auto)* |
-| `SOLACE_RECONNECT_MODE` | `seamless` (keep consuming / rebind) or `stop` (return to mode menu) | `seamless` |
+| `SOLACE_INTERACTIVE` | `true` = startup wizard (consumer dest/mode/start-gate, publisher dest prompts, xfer confirms). `false` = take env/CLI and proceed. **Does not affect the browser.** | `false` |
+| `SOLACE_CONSUME_MODE` | `continuous` or `step`. When **unset**, defaults by dest: queue→`step`, topic→`continuous`. When `SOLACE_INTERACTIVE=false`, `step` is ignored (treated as continuous) | *(auto)* |
+| `SOLACE_RECONNECT_MODE` | `seamless` (keep consuming / rebind) or `stop` (interactive: return to mode menu; non-interactive: exit with error) | `seamless` |
 | `SOLACE_DELIVERY_MODE` | Publisher: `auto` / `direct` / `persistent` (`auto` = Direct for topic, Persistent for queue) | `auto` |
+| `SOLACE_PUBLISH_COUNT` | Non-interactive publisher: number of messages to send then exit. Ignored when interactive. Must be ≥ 1. Payload is a unique UTC ISO-8601 timestamp per send | `1` |
 | `SOLACE_CONSOLE_FULL` | Full metadata + payload on console | `false` |
 | `SOLACE_LOG_TO_FILE` | Append events to a log file | `true` |
 | `SOLACE_LOG_FILE` | Log path (relative to cwd) | `solace-events.log` |
 | `SOLACE_LOG_FORMAT` | Log line format: `full`/`ndjson` (NDJSON), `simple`/`compact`, or `payload_only` (`payload`/`payload-only`/`body`) | `full` |
 | `SOLACE_LOG_WARN_MB` | Warn + confirm at startup if existing log is ≥ this many MiB (`0` = off) | `50` |
 | `SOLACE_LOG_WARN_BYTES` | Optional exact byte threshold (overrides `SOLACE_LOG_WARN_MB`) | — |
-| `SOLACE_XFER_CHUNK_BYTES` | `xfer.py` DATA chunk size (bytes). Max `10000000` (Solace common max payload). Prompt can override. | `1048576` (1 MiB) |
+| `SOLACE_XFER_ROLE` | `sender` or `receiver`. Required when `SOLACE_INTERACTIVE=false` | — |
+| `SOLACE_XFER_CHUNK_BYTES` | `xfer.py` DATA chunk size (bytes). Max `10000000` (Solace common max payload). Prompt can override when interactive. | `1048576` (1 MiB) |
 
 ## Run
 
@@ -72,7 +80,12 @@ python consumer.py -e ./configs/broker.env
 python consumer.py --env /abs/path/to/.env
 ```
 
-Interactive menu loop (same UX as `solace-consumer` in solace-qdeb):
+Default `SOLACE_INTERACTIVE=false` skips dest/mode/start-gate prompts and starts
+consuming from `SOLACE_SOURCE_*` (legacy `SOLACE_TOPIC` / `SOLACE_QUEUE` if unset).
+**`SOLACE_CONSUME_MODE=step` is ignored** (queue default step too): consume runs
+continuous with no Mode?/start-gate/per-message Enter. The summary notes
+`mode=continuous (step bypassed; non-interactive)` when that happens.
+Ctrl+C quits. Set `SOLACE_INTERACTIVE=true` for the menu loop (same UX as `solace-consumer` in solace-qdeb):
 
 1. Dest type: `[q]ueue` / `[t]opic` (default from env)
 2. Queue/topic name prompt (fixed for the session). Topic accepts a comma-separated list (e.g. `a/b, c/d/>`); each entry is subscribed.
@@ -99,7 +112,7 @@ python browser.py -e dev      # loads .env.dev
 python browser.py -e ./configs/broker.env
 ```
 
-Prompts for queue name and page size, then fetches page 1 (oldest messages — no full count scan). **Item #1 is oldest**; page 1 is the head of the queue. Commands: page number, `n`/`p`, `s`/`size`, `r`, `i<n>`, `d` (current page dump), `a`/`a<n>` (dump all oldest-first to the log file, optional limit), `h`, `q`. **Ctrl+C** quits (during `a`, aborts the dump and returns to the menu). Until the last page is reached, the status line shows `items 1-10 of ?` / `page 2+`.
+Always interactive (`SOLACE_INTERACTIVE` is ignored). Prompts for queue name and page size (default `SOLACE_SOURCE_QUEUE` / legacy `SOLACE_QUEUE`), then fetches page 1 (oldest messages — no full count scan). **Item #1 is oldest**; page 1 is the head of the queue. Commands: page number, `n`/`p`, `s`/`size`, `r`, `i<n>`, `d` (current page dump), `a`/`a<n>` (dump all oldest-first to the log file, optional limit), `c`/`c<n>` (CSV dump of all oldest-first to `dump-yyyyMMdd-HHmmss.csv` in cwd; aliases `csv`, `csv<n>`, `csv n`; independent of `SOLACE_LOG_TO_FILE`; columns `timestamp`, `destination`, `appMsgId`, `bytes`, `payload`), `h`, `q`. **Ctrl+C** quits (during `a` or `c`, aborts the dump and returns to the menu). Until the last page is reached, the status line shows `items 1-10 of ?` / `page 2+`.
 
 ### Publisher
 
@@ -109,7 +122,7 @@ python publisher.py -e dev      # loads .env.dev
 python publisher.py -e ./configs/broker.env
 ```
 
-Prompts for topic or queue (from `SOLACE_SOURCE_TYPE`), validates queue destinations via a short browse bind, then enters the publish menu:
+Uses `SOLACE_DEST_TYPE` / `SOLACE_DEST_TOPIC` / `SOLACE_DEST_QUEUE` (legacy source keys if unset). With `SOLACE_INTERACTIVE=true`, prompts for topic or queue then enters the publish menu (`SOLACE_PUBLISH_COUNT` is ignored). Default non-interactive skips dest questions and the menu: it sends `SOLACE_PUBLISH_COUNT` messages (default 1) and exits. Each payload is a unique UTC ISO-8601 timestamp with milliseconds (e.g. `2026-11-02T03:21:00.123Z`). Count ≤ 0 or a missing dest is an error. Exit 0 if all sends succeed; non-zero if any fail. Validates queue destinations via a short browse bind:
 
 | Command | Action |
 | --- | --- |
@@ -145,9 +158,12 @@ Same `.env` connection keys as the other tools (`SOLACE_HOST`, VPN, credentials,
 | **DATA** | `data` | raw file bytes | `xfer-id`, `xfer-seq` (0-based) |
 | **END** | `end` | JSON UTF-8: `kind`, `transferId`, `sha256` | `xfer-id` |
 
+When `SOLACE_INTERACTIVE=true`:
 1. **Role?** `[s]ender` / `[r]eceiver`
 2. **Dest type?** `[q]ueue` / `[t]opic` (default **queue**)
 3. **Name?** Empty queue → `xfer-{8 hex}`; empty topic → `xfer/{guid}` (printed so you can copy it to the other side)
+
+When `SOLACE_INTERACTIVE=false`: `SOLACE_XFER_ROLE` is required; dest is `SOLACE_DEST_*` (legacy `SOLACE_SOURCE_TYPE` / `SOLACE_QUEUE` / `SOLACE_TOPIC`). Sender file is the first positional CLI arg. Receiver save path defaults from META and fails if the file exists. The delete-queue prompt is skipped.
 
 **Queue provision:** both roles try CCSMP endpoint provision of a **durable exclusive** queue. If it is created here, `createdByUs=true` and this side owns the delete prompt. If it already exists, it is reused (`createdByUs=false`, no delete). If provision is denied and the queue is missing: **sender** is offered a **topic** fallback (default random, copyable); **receiver** errors (cannot receive from a missing queue). Existing queues are bound even when create is not allowed.
 
@@ -161,30 +177,69 @@ On **success, error, or Ctrl+C**: if `createdByUs`, the receiver prompts `Delete
 
 `.NET` and Python xfer envelopes are interoperable (same user properties and JSON).
 
-## Docker
+## Docker / Kubernetes
 
-Build an interactive image (drops you into a shell; run tools manually):
+The image is a **parked debug pod**: PID 1 is `sleep infinity`. Tools are interactive CLIs — attach with `docker exec` / `kubectl exec -it`. The image runs as **root** (simpler for kube troubleshooting and writable `/app` logs). Do not bake a real `.env` into the image.
 
 ```bash
 docker build -t solace-subber .
+# Apple Silicon / mixed clusters:
+# docker build --platform linux/amd64 -t solace-subber .
 ```
 
-Run with your `.env` mounted and an interactive TTY:
+Local (same idle pattern as kube):
 
 ```bash
-docker run --rm -it \
+docker run -d --name solace-subber \
   -v "$(pwd)/.env:/app/.env:ro" \
-  -v "$(pwd)/solace-events.log:/app/solace-events.log" \
+  -v "$(pwd)/logs:/app/logs" \
+  -e SOLACE_LOG_FILE=/app/logs/solace-events.log \
   solace-subber
 
-# inside the container:
-python consumer.py
-python browser.py
-python publisher.py
-python xfer.py
+docker exec -it solace-subber python consumer.py
+docker exec -it solace-subber python browser.py
 ```
 
-On Windows PowerShell, use `${PWD}` instead of `$(pwd)`.
+`--entrypoint bash` still works if you want a shell instead of exec.
+
+### Kubernetes
+
+Mount credentials as a Secret/ConfigMap file at `/app/.env` (or `/app/.env.dev` and pass `-e`). Use an `emptyDir` (or PVC) for logs. `SOLACE_CONSUME_MODE=continuous` avoids step-mode Enter prompts over `kubectl exec`.
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: solace-subber
+spec:
+  containers:
+    - name: solace-subber
+      image: solace-subber:latest
+      imagePullPolicy: IfNotPresent
+      env:
+        - name: SOLACE_CONSUME_MODE
+          value: continuous
+        - name: SOLACE_LOG_FILE
+          value: /app/logs/solace-events.log
+      volumeMounts:
+        - name: env
+          mountPath: /app/.env
+          subPath: .env
+        - name: logs
+          mountPath: /app/logs
+  volumes:
+    - name: env
+      secret:
+        secretName: solace-subber-env   # key: .env
+    - name: logs
+      emptyDir: {}
+```
+
+```bash
+kubectl exec -it deploy/solace-subber -- python consumer.py
+kubectl exec -it deploy/solace-subber -- python consumer.py -e /app/.env.dev
+kubectl exec -it pod/solace-subber -- python browser.py
+```
 
 ## Project layout
 

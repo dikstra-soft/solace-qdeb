@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 
+import csv
 import re
 import signal
 import sys
+from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 from solace.messaging.receiver.message_receiver import InboundMessage
@@ -143,13 +146,15 @@ def print_help(detailed: bool = False) -> None:
             "  i<n>        full dump of absolute item #n (1 = oldest, e.g. i5)\n"
             "  d           full dump of current page (console + log file)\n"
             "  a / a<n>    dump all from oldest to file (optional limit, e.g. a100)\n"
+            "  c / c<n>    dump all oldest-first to dump-yyyyMMdd-HHmmss.csv (e.g. c100)\n"
+            "              aliases: csv, csv<n>, csv n\n"
             "  h           this help\n"
             "  q           quit\n"
             "Item #1 is the oldest message. Page 1 is the head of the queue (native browse order).\n"
             "Browsing is non-destructive. Queue length is discovered while paging."
         )
     else:
-        print("Commands: <n>, n/p, s size, i<N>, d dump page, a/a<N> dump all, r refresh, h help, q quit")
+        print("Commands: <n>, n/p, s size, i<N>, d dump page, a/a<N> dump all, c/c<N> csv, r refresh, h help, q quit")
 
 
 class BrowseAction(str, Enum):
@@ -161,6 +166,7 @@ class BrowseAction(str, Enum):
     GO_TO_PAGE = "goto"
     DUMP_PAGE = "dump"
     DUMP_ALL = "dump_all"
+    DUMP_CSV = "dump_csv"
     DUMP_ITEM = "dump_item"
     CHANGE_PAGE_SIZE = "size"
 
@@ -185,6 +191,8 @@ def try_parse_command(command: str) -> Tuple[Optional[BrowseAction], int]:
         "dump": BrowseAction.DUMP_PAGE,
         "a": BrowseAction.DUMP_ALL,
         "all": BrowseAction.DUMP_ALL,
+        "c": BrowseAction.DUMP_CSV,
+        "csv": BrowseAction.DUMP_CSV,
         "s": BrowseAction.CHANGE_PAGE_SIZE,
         "size": BrowseAction.CHANGE_PAGE_SIZE,
     }
@@ -206,6 +214,18 @@ def try_parse_command(command: str) -> Tuple[Optional[BrowseAction], int]:
     all_prefix = re.fullmatch(r"(?:a|all)\s+(\d+)", command, flags=re.IGNORECASE)
     if all_prefix:
         return BrowseAction.DUMP_ALL, int(all_prefix.group(1))
+
+    csv_match = re.fullmatch(r"csv(\d+)", lower)
+    if csv_match:
+        return BrowseAction.DUMP_CSV, int(csv_match.group(1))
+
+    csv_prefix = re.fullmatch(r"(?:c|csv)\s+(\d+)", command, flags=re.IGNORECASE)
+    if csv_prefix:
+        return BrowseAction.DUMP_CSV, int(csv_prefix.group(1))
+
+    c_match = re.fullmatch(r"c(\d+)", lower)
+    if c_match:
+        return BrowseAction.DUMP_CSV, int(c_match.group(1))
 
     if lower.isdigit():
         return BrowseAction.GO_TO_PAGE, int(lower)
@@ -372,6 +392,74 @@ def dump_all(
     return True
 
 
+def new_csv_dump_path() -> Path:
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = Path.cwd() / f"dump-{stamp}.csv"
+    if not path.exists():
+        return path
+    for i in range(1, 1000):
+        candidate = Path.cwd() / f"dump-{stamp}-{i}.csv"
+        if not candidate.exists():
+            return candidate
+    raise OSError("could not pick a unique dump-*.csv name")
+
+
+def dump_csv(browser: QueueBrowser, limit: int) -> bool:
+    global DUMP_ALL_ACTIVE, DUMP_ALL_CANCEL
+    try:
+        path = new_csv_dump_path()
+    except Exception as exc:
+        print(f"  [csv] could not create dump file: {exc}", file=sys.stderr)
+        return False
+
+    cap = limit if limit > 0 else None
+    cap_label = f"oldest {cap}" if cap is not None else "all (oldest-first)"
+    print(f"  dumping {cap_label} to {path} ...")
+
+    logged = 0
+    failed = 0
+    aborted = False
+    DUMP_ALL_CANCEL = False
+
+    def cancelled() -> bool:
+        return DUMP_ALL_CANCEL
+
+    DUMP_ALL_ACTIVE = True
+    try:
+        with path.open("x", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(payload_formatter.CSV_COLUMNS)
+            try:
+                for message in browser.for_each_from_oldest(cap, cancelled=cancelled):
+                    try:
+                        writer.writerow(payload_formatter.csv_row(message))
+                        logged += 1
+                        if logged == 1 or logged % 100 == 0:
+                            handle.flush()
+                            print(f"\r  dumped {logged}...", end="", flush=True)
+                    except Exception:
+                        failed += 1
+            except KeyboardInterrupt:
+                DUMP_ALL_CANCEL = True
+                aborted = True
+    except Exception as exc:
+        print()
+        print(f"  [csv] dump failed: {exc}", file=sys.stderr)
+        return True
+    finally:
+        DUMP_ALL_ACTIVE = False
+
+    print()
+    if DUMP_ALL_CANCEL or aborted:
+        extra = f" ({failed} failed)" if failed else ""
+        print(f"  csv dump aborted after {logged} item(s){extra} ({path}).")
+    elif failed:
+        print(f"  dumped {logged} item(s) to {path} ({failed} failed)")
+    else:
+        print(f"  dumped {logged} item(s) to {path}")
+    return True
+
+
 def dump_item(browser: QueueBrowser, absolute_item: int, known_total: Optional[int]) -> bool:
     if absolute_item < 1:
         print(f"  item #{absolute_item} is out of range.")
@@ -524,6 +612,9 @@ def main() -> int:
                 pause_for_continue()
         elif action == BrowseAction.DUMP_ALL:
             if dump_all(browser, number, file_logger, log_to_file=config.log_to_file):
+                pause_for_continue()
+        elif action == BrowseAction.DUMP_CSV:
+            if dump_csv(browser, number):
                 pause_for_continue()
         elif action == BrowseAction.DUMP_ITEM:
             if dump_item(browser, number, known_total):

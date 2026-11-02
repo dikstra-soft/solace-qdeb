@@ -29,6 +29,7 @@ class RuntimeState:
         self.consume_stop_reason: Optional[str] = None
         self.delete_prompting = False
         self.skip_delete = False
+        self.interactive = True
         self._lock = threading.Lock()
 
     def request_quit(self) -> None:
@@ -114,6 +115,10 @@ class StdinLinePump:
 
 def install_signal_handler(runtime: RuntimeState) -> None:
     def handler(signum, frame):  # noqa: ARG001
+        if not runtime.interactive:
+            runtime.request_quit()
+            runtime.cancel_active()
+            return
         if runtime.phase in (PromptPhase.STARTUP, PromptPhase.MENU):
             runtime.request_quit()
             runtime.cancel_active()

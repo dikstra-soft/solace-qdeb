@@ -21,6 +21,37 @@ class SourceType(str, Enum):
     QUEUE = "queue"
 
 
+def env_first(env_file: dict, *keys: str) -> str:
+    """First non-empty value among keys (.env then process env)."""
+    for key in keys:
+        value = dotenv.get(key, env_file, default=None)
+        if value is not None and str(value).strip():
+            return value
+    return ""
+
+
+def parse_endpoint_type(raw: str | None, setting_name: str, default: SourceType) -> SourceType:
+    if raw is None or str(raw).strip() == "":
+        return default
+    normalized = str(raw).strip().lower()
+    if normalized == "topic":
+        return SourceType.TOPIC
+    if normalized == "queue":
+        return SourceType.QUEUE
+    raise ValueError(f"{setting_name} must be 'topic' or 'queue', got '{raw}'.")
+
+
+def parse_dest_type(env_file: dict) -> SourceType:
+    dest_raw = dotenv.get("SOLACE_DEST_TYPE", env_file, default=None)
+    if dest_raw is not None and str(dest_raw).strip() != "":
+        return parse_endpoint_type(dest_raw, "SOLACE_DEST_TYPE", SourceType.TOPIC)
+    return parse_endpoint_type(
+        dotenv.get("SOLACE_SOURCE_TYPE", env_file, default=None),
+        "SOLACE_SOURCE_TYPE",
+        SourceType.TOPIC,
+    )
+
+
 class ConsumeMode(str, Enum):
     CONTINUOUS = "continuous"
     STEP = "step"
@@ -53,6 +84,22 @@ def parse_log_format(raw: str | None) -> LogFormat:
     )
 
 
+class XferRole(str, Enum):
+    SENDER = "sender"
+    RECEIVER = "receiver"
+
+
+def parse_xfer_role(raw: str | None) -> Optional[XferRole]:
+    if raw is None or str(raw).strip() == "":
+        return None
+    normalized = str(raw).strip().lower()
+    if normalized in ("sender", "s"):
+        return XferRole.SENDER
+    if normalized in ("receiver", "r"):
+        return XferRole.RECEIVER
+    raise ValueError(f"SOLACE_XFER_ROLE must be 'sender' or 'receiver', got '{raw}'.")
+
+
 class DeliveryModeSetting(str, Enum):
     """Publisher delivery mode from env (auto resolves by destination type)."""
 
@@ -83,6 +130,7 @@ class AppConfig:
     mode: ConsumeMode
     mode_explicit: bool
     reconnect_mode: ReconnectMode
+    interactive: bool
     console_full: bool
     log_to_file: bool
     log_file: str
@@ -108,7 +156,7 @@ class AppConfig:
         return cls.from_env(env_file), loaded_path
 
     @classmethod
-    def from_env(cls, env_file: dict) -> "AppConfig":
+    def from_env(cls, env_file: dict, *, require_source: bool = True) -> "AppConfig":
         def get(key: str, default: Optional[str] = None, *, required: bool = False) -> str:
             value = dotenv.get(key, env_file, required=required, default=default)
             if value is None:
@@ -142,15 +190,11 @@ class AppConfig:
         host = get("SOLACE_HOST", required=True)
         secure = get_bool("SOLACE_SECURE", False)
 
-        source_raw = (get("SOLACE_SOURCE_TYPE", default="topic") or "topic").lower()
-        if source_raw == "topic":
-            source = SourceType.TOPIC
-        elif source_raw == "queue":
-            source = SourceType.QUEUE
-        else:
-            raise ValueError(
-                f"SOLACE_SOURCE_TYPE must be 'topic' or 'queue', got '{source_raw}'."
-            )
+        source = parse_endpoint_type(
+            dotenv.get("SOLACE_SOURCE_TYPE", env_file, default=None),
+            "SOLACE_SOURCE_TYPE",
+            SourceType.TOPIC,
+        )
 
         mode_raw = dotenv.get("SOLACE_CONSUME_MODE", env_file, default=None)
         mode_explicit = mode_raw is not None and str(mode_raw).strip() != ""
@@ -199,15 +243,20 @@ class AppConfig:
                 raise ValueError("SOLACE_LOG_WARN_MB must be >= 0.")
             log_warn_bytes = warn_mb * 1024 * 1024
 
-        topic = get("SOLACE_TOPIC", default="")
-        queue = get("SOLACE_QUEUE", default="")
+        topic = env_first(env_file, "SOLACE_SOURCE_TOPIC", "SOLACE_TOPIC")
+        queue = env_first(env_file, "SOLACE_SOURCE_QUEUE", "SOLACE_QUEUE")
 
-        if source == SourceType.TOPIC and not parse_topics(topic):
-            raise ValueError(
-                "SOLACE_SOURCE_TYPE=topic requires SOLACE_TOPIC to be set to at least one non-empty topic."
-            )
-        if source == SourceType.QUEUE and not queue.strip():
-            raise ValueError("SOLACE_SOURCE_TYPE=queue requires SOLACE_QUEUE to be set.")
+        if require_source:
+            if source == SourceType.TOPIC and not parse_topics(topic):
+                raise ValueError(
+                    "SOLACE_SOURCE_TYPE=topic requires SOLACE_SOURCE_TOPIC "
+                    "(or legacy SOLACE_TOPIC) to be set to at least one non-empty topic."
+                )
+            if source == SourceType.QUEUE and not queue.strip():
+                raise ValueError(
+                    "SOLACE_SOURCE_TYPE=queue requires SOLACE_SOURCE_QUEUE "
+                    "(or legacy SOLACE_QUEUE) to be set."
+                )
 
         return cls(
             host=host,
@@ -225,6 +274,7 @@ class AppConfig:
             mode=mode,
             mode_explicit=mode_explicit,
             reconnect_mode=reconnect_mode,
+            interactive=get_bool("SOLACE_INTERACTIVE", False),
             console_full=get_bool("SOLACE_CONSOLE_FULL", False),
             log_to_file=get_bool("SOLACE_LOG_TO_FILE", True),
             log_file=get("SOLACE_LOG_FILE", default="solace-events.log") or "solace-events.log",
@@ -257,6 +307,7 @@ class AppConfig:
             f"  {target}",
             f"  mode    = {mode_text}",
             f"  reconnect = {self.reconnect_mode.value}",
+            f"  interactive = {'on' if self.interactive else 'off'}",
             f"  console = {'full' if self.console_full else 'simple'}",
             f"  logfile = {self.log_file if self.log_to_file else 'off'}",
             f"  logfmt  = {self.log_format.value}",
@@ -289,7 +340,7 @@ class BrowserAppConfig:
 
     @classmethod
     def from_env(cls, env_file: dict) -> "BrowserAppConfig":
-        app = AppConfig.from_env(env_file)
+        app = AppConfig.from_env(env_file, require_source=False)
         page_size_raw = dotenv.get("SOLACE_BROWSER_PAGE_SIZE", env_file, default="10")
         try:
             page_size = int(page_size_raw or "10")
@@ -310,7 +361,7 @@ class BrowserAppConfig:
             ssl_validate_certificate=app.ssl_validate_certificate,
             connect_timeout_ms=app.connect_timeout_ms,
             reconnect_retries=app.reconnect_retries,
-            default_queue=app.queue,
+            default_queue=env_first(env_file, "SOLACE_SOURCE_QUEUE", "SOLACE_QUEUE"),
             default_page_size=page_size,
             console_full=app.console_full,
             log_to_file=app.log_to_file,
@@ -340,6 +391,7 @@ class BrowserAppConfig:
             log_file=self.log_file,
             log_format=self.log_format,
             log_warn_bytes=0,
+            interactive=False,
         )
 
     def describe(self, queue: str, page_size: int) -> str:
@@ -372,10 +424,12 @@ class PublisherAppConfig:
     ssl_validate_certificate: bool
     connect_timeout_ms: int
     reconnect_retries: int
-    source: SourceType
+    dest_type: SourceType
     topic: str
     queue: str
     delivery_mode: DeliveryModeSetting
+    interactive: bool
+    publish_count: int
 
     @classmethod
     def load(cls, env_path: Optional[str] = None) -> Tuple["PublisherAppConfig", Optional[str]]:
@@ -417,15 +471,7 @@ class PublisherAppConfig:
         host = get("SOLACE_HOST", required=True)
         secure = get_bool("SOLACE_SECURE", False)
 
-        source_raw = (get("SOLACE_SOURCE_TYPE", default="topic") or "topic").lower()
-        if source_raw == "topic":
-            source = SourceType.TOPIC
-        elif source_raw == "queue":
-            source = SourceType.QUEUE
-        else:
-            raise ValueError(
-                f"SOLACE_SOURCE_TYPE must be 'topic' or 'queue', got '{source_raw}'."
-            )
+        dest_type = parse_dest_type(env_file)
 
         delivery_raw = dotenv.get("SOLACE_DELIVERY_MODE", env_file, default=None)
         if delivery_raw is None or str(delivery_raw).strip() == "":
@@ -454,10 +500,12 @@ class PublisherAppConfig:
             ssl_validate_certificate=get_bool("SOLACE_SSL_VALIDATE_CERT", False),
             connect_timeout_ms=get_int("SOLACE_CONNECT_TIMEOUT_MS", 10000),
             reconnect_retries=get_int("SOLACE_RECONNECT_RETRIES", 3),
-            source=source,
-            topic=get("SOLACE_TOPIC", default=""),
-            queue=get("SOLACE_QUEUE", default=""),
+            dest_type=dest_type,
+            topic=env_first(env_file, "SOLACE_DEST_TOPIC", "SOLACE_TOPIC"),
+            queue=env_first(env_file, "SOLACE_DEST_QUEUE", "SOLACE_QUEUE"),
             delivery_mode=delivery,
+            interactive=get_bool("SOLACE_INTERACTIVE", False),
+            publish_count=get_int("SOLACE_PUBLISH_COUNT", 1),
         )
 
     def to_connection_config(self) -> AppConfig:
@@ -471,7 +519,7 @@ class PublisherAppConfig:
             ssl_validate_certificate=self.ssl_validate_certificate,
             connect_timeout_ms=self.connect_timeout_ms,
             reconnect_retries=self.reconnect_retries,
-            source=self.source,
+            source=self.dest_type,
             topic=self.topic,
             queue=self.queue,
             mode=ConsumeMode.CONTINUOUS,
@@ -482,6 +530,7 @@ class PublisherAppConfig:
             log_file="solace-events.log",
             log_format=LogFormat.FULL,
             log_warn_bytes=0,
+            interactive=self.interactive,
         )
 
     def resolve_delivery(self, destination_type: SourceType) -> MessageDeliveryKind:
@@ -511,7 +560,10 @@ class PublisherAppConfig:
             f"  user     = {self.username}",
             f"  dest     = {dest_type.value} '{dest_name}'",
             f"  delivery = {delivery.value}{auto_note}",
+            f"  interactive = {'on' if self.interactive else 'off'}",
         ]
+        if not self.interactive:
+            lines.append(f"  publishCount = {self.publish_count}")
         return "\n".join(lines)
 
 
@@ -531,9 +583,12 @@ class XferAppConfig:
     ssl_validate_certificate: bool
     connect_timeout_ms: int
     reconnect_retries: int
+    dest_type: SourceType
     topic: str
     queue: str
     chunk_bytes: int
+    interactive: bool
+    role: Optional[XferRole]
 
     @classmethod
     def load(cls, env_path: Optional[str] = None) -> Tuple["XferAppConfig", Optional[str]]:
@@ -591,9 +646,12 @@ class XferAppConfig:
             ssl_validate_certificate=get_bool("SOLACE_SSL_VALIDATE_CERT", False),
             connect_timeout_ms=get_int("SOLACE_CONNECT_TIMEOUT_MS", 10000),
             reconnect_retries=get_int("SOLACE_RECONNECT_RETRIES", 3),
-            topic=get("SOLACE_TOPIC", default=""),
-            queue=get("SOLACE_QUEUE", default=""),
+            dest_type=parse_dest_type(env_file),
+            topic=env_first(env_file, "SOLACE_DEST_TOPIC", "SOLACE_TOPIC"),
+            queue=env_first(env_file, "SOLACE_DEST_QUEUE", "SOLACE_QUEUE"),
             chunk_bytes=chunk,
+            interactive=get_bool("SOLACE_INTERACTIVE", False),
+            role=parse_xfer_role(dotenv.get("SOLACE_XFER_ROLE", env_file, default=None)),
         )
 
     def to_connection_config(self) -> AppConfig:
@@ -607,7 +665,7 @@ class XferAppConfig:
             ssl_validate_certificate=self.ssl_validate_certificate,
             connect_timeout_ms=self.connect_timeout_ms,
             reconnect_retries=self.reconnect_retries,
-            source=SourceType.QUEUE,
+            source=self.dest_type,
             topic=self.topic,
             queue=self.queue,
             mode=ConsumeMode.CONTINUOUS,
@@ -618,16 +676,20 @@ class XferAppConfig:
             log_file="solace-events.log",
             log_format=LogFormat.FULL,
             log_warn_bytes=0,
+            interactive=self.interactive,
         )
 
     def describe(self) -> str:
         tls_note = ""
         if self.secure and not self.ssl_validate_certificate:
             tls_note = ", cert validation OFF"
+        role_text = "(prompt)" if self.role is None else self.role.value
         lines = [
             f"  host       = {self.host_url}  ({'secure SMF (TLS)' if self.secure else 'plain SMF'}{tls_note})",
             f"  vpn        = {self.vpn}",
             f"  user       = {self.username}",
             f"  chunkBytes = {self.chunk_bytes}",
+            f"  interactive = {'on' if self.interactive else 'off'}",
+            f"  xferRole   = {role_text}",
         ]
         return "\n".join(lines)

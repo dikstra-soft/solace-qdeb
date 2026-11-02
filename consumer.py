@@ -19,7 +19,7 @@ from solace.messaging.resources.topic_subscription import TopicSubscription
 
 from common import payload_formatter
 from common.cli import parse_env_file
-from common.config import AppConfig, LogFormat, ReconnectMode, SourceType
+from common.config import AppConfig, LogFormat, ReconnectMode, SourceType, parse_topics
 from common.connection import SolaceConnection
 from common.event_file_logger import EventFileLogger, resolve_log_path
 from common.prompts import (
@@ -118,6 +118,19 @@ def format_bytes(num: int) -> str:
     if num >= 1024:
         return f"{num / 1024:.2f} KB"
     return f"{num} B"
+
+
+def effective_consume_mode(config: AppConfig, source: SourceType) -> tuple[str, bool]:
+    mode = config.resolve_mode(source).value
+    if not config.interactive and mode == "step":
+        return "continuous", True
+    return mode, False
+
+
+def format_mode_for_using(mode: str, step_bypassed: bool) -> str:
+    if step_bypassed:
+        return "continuous (step bypassed; non-interactive)"
+    return mode
 
 
 def print_consume_summary(
@@ -406,16 +419,18 @@ def main() -> int:
                         f"({format_bytes(size)}; threshold {format_bytes(config.log_warn_bytes)}).",
                         file=sys.stderr,
                     )
-                    print("continue? [y]/n (default y): ", end="", flush=True)
-                    answer = (sys.stdin.readline() or "").strip().lower()
-                    if answer in ("n", "no"):
-                        print("exiting so you can clean up the log file.")
-                        return 0
+                    if config.interactive:
+                        print("continue? [y]/n (default y): ", end="", flush=True)
+                        answer = (sys.stdin.readline() or "").strip().lower()
+                        if answer in ("n", "no"):
+                            print("exiting so you can clean up the log file.")
+                            return 0
         except Exception as exc:
             print(f"Could not check log file size: {exc}", file=sys.stderr)
 
     stdin = StdinLinePump()
     runtime = RuntimeState()
+    runtime.interactive = config.interactive
     install_signal_handler(runtime)
     sink = MessageSink()
     consume = ActiveConsume()
@@ -481,53 +496,100 @@ def main() -> int:
     print("connected.")
 
     runtime.phase = PromptPhase.STARTUP
-    session_source = prompt_source_type(config.source, runtime, stdin)
-    if session_source is None or runtime.quit_requested:
-        if file_logger:
-            file_logger.close()
-        connection.disconnect()
-        stdin.close()
-        return 0
-
-    if session_source == SourceType.QUEUE:
-        session_queue = prompt_queue(config.queue, runtime, stdin)
-        if session_queue is None or runtime.quit_requested:
+    if config.interactive:
+        session_source = prompt_source_type(config.source, runtime, stdin)
+        if session_source is None or runtime.quit_requested:
             if file_logger:
                 file_logger.close()
             connection.disconnect()
             stdin.close()
             return 0
-        session_topics: list[str] = []
+
+        if session_source == SourceType.QUEUE:
+            session_queue = prompt_queue(config.queue, runtime, stdin)
+            if session_queue is None or runtime.quit_requested:
+                if file_logger:
+                    file_logger.close()
+                connection.disconnect()
+                stdin.close()
+                return 0
+            session_topics: list[str] = []
+        else:
+            session_topics = prompt_topic(config.topic, runtime, stdin)
+            if session_topics is None or runtime.quit_requested:
+                if file_logger:
+                    file_logger.close()
+                connection.disconnect()
+                stdin.close()
+                return 0
+            session_queue = ""
+        default_mode = config.resolve_mode(session_source).value
     else:
-        session_topics = prompt_topic(config.topic, runtime, stdin)
-        if session_topics is None or runtime.quit_requested:
-            if file_logger:
-                file_logger.close()
-            connection.disconnect()
-            stdin.close()
-            return 0
-        session_queue = ""
+        session_source = config.source
+        if session_source == SourceType.QUEUE:
+            if not config.queue.strip():
+                print(
+                    "ERROR: SOLACE_SOURCE_TYPE=queue requires SOLACE_SOURCE_QUEUE "
+                    "(or legacy SOLACE_QUEUE).",
+                    file=sys.stderr,
+                )
+                if file_logger:
+                    file_logger.close()
+                connection.disconnect()
+                stdin.close()
+                return 1
+            session_queue = config.queue
+            session_topics = []
+            dest = session_queue
+        else:
+            session_topics = parse_topics(config.topic)
+            if not session_topics:
+                print(
+                    "ERROR: SOLACE_SOURCE_TYPE=topic requires SOLACE_SOURCE_TOPIC "
+                    "(or legacy SOLACE_TOPIC).",
+                    file=sys.stderr,
+                )
+                if file_logger:
+                    file_logger.close()
+                connection.disconnect()
+                stdin.close()
+                return 1
+            session_queue = ""
+            dest = (
+                session_topics[0]
+                if len(session_topics) == 1
+                else f"topics={len(session_topics)} [{', '.join(session_topics)}]"
+            )
+        default_mode, step_bypassed = effective_consume_mode(config, session_source)
+        print(
+            f"using: source={session_source.value} dest={dest} "
+            f"mode={format_mode_for_using(default_mode, step_bypassed)} "
+            f"reconnect={config.reconnect_mode.value} interactive=off"
+        )
 
-    default_mode = config.resolve_mode(session_source).value
+    exit_code = 0
 
     while not runtime.quit_requested:
         runtime.clear_cancel()
         runtime.clear_stop_reason()
         runtime.phase = PromptPhase.MENU
         stdin.drain()
-        print()
-        mode = prompt_mode(default_mode, runtime, stdin)
-        if mode is None or runtime.quit_requested:
-            break
+        if config.interactive:
+            print()
+            mode = prompt_mode(default_mode, runtime, stdin)
+            if mode is None or runtime.quit_requested:
+                break
 
-        runtime.phase = PromptPhase.START_GATE
-        print("press Enter to start consuming (Ctrl+C to stop & return to menu)... ", end="", flush=True)
-        read_line_cancellable(runtime, stdin)
-        if runtime.quit_requested:
-            break
-        if runtime.cancel_requested:
-            runtime.clear_cancel()
-            continue
+            runtime.phase = PromptPhase.START_GATE
+            print("press Enter to start consuming (Ctrl+C to stop & return to menu)... ", end="", flush=True)
+            read_line_cancellable(runtime, stdin)
+            if runtime.quit_requested:
+                break
+            if runtime.cancel_requested:
+                runtime.clear_cancel()
+                continue
+        else:
+            mode = default_mode
 
         bounded = session_source == SourceType.TOPIC and mode == "step"
         collection: queue.Queue[InboundMessage] = queue.Queue(maxsize=1 if bounded else 0)
@@ -573,6 +635,8 @@ def main() -> int:
                 )
         except Exception as exc:
             print(f"Failed to set up {session_source.value}: {exc}", file=sys.stderr)
+            if not config.interactive:
+                exit_code = 1
         finally:
             stop_reason = runtime.consume_stop_reason
             sink.reset(None)
@@ -593,6 +657,11 @@ def main() -> int:
         else:
             print(f"stopped. consumed={received_counter[0]}{dropped_note}")
 
+        if not config.interactive:
+            if not runtime.quit_requested and stop_reason:
+                exit_code = 1
+            break
+
     if runtime.quit_requested:
         print()
         print("stopping...")
@@ -605,7 +674,7 @@ def main() -> int:
     dropped_note = f", dropped={sink.dropped} (paused/topic)" if sink.dropped > 0 else ""
     print()
     print(f"bye. consumed={received_counter[0]}{dropped_note}")
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

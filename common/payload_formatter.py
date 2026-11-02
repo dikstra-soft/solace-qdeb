@@ -575,3 +575,17 @@ def build_log_line(message: InboundMessage, log_format: LogFormat) -> str:
     return build_json_line(message)
 
 
+CSV_COLUMNS = ("timestamp", "destination", "appMsgId", "bytes", "payload")
+
+
+def csv_row(message: InboundMessage) -> list:
+    """UTC timestamp, destination, appMsgId, byte count, full untruncated payload."""
+    payload = _payload_bytes(message)
+    ts = _resolve_message_timestamp_ms(message)
+    timestamp = _format_timestamp_from_ms(ts) if ts else ""
+    dest = _safe_attr(message, "get_destination_name") or ""
+    app_id = _safe_attr(message, "get_application_message_id") or ""
+    nbytes = len(payload) if payload else 0
+    return [timestamp, dest, str(app_id), nbytes, _payload_text(payload)]
+
+
